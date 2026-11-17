@@ -1,29 +1,18 @@
-"""Freeze occurrence colour interpretation and display conditions."""
+"""Freeze occurrence colour interpretation and display conditions.
+
+Every occurrence keeps its own trim, source identity, colour encoding and
+frame count.  The snapshot is immutable, so later edits, reordering, trim
+changes or a process restart do not alter a saved plan.  Whole-shot exposure
+statistics are derived by the renderer from the complete materialized shot
+(a single sequential decode), which keeps a middle preview identical to the
+matching frames of a full delivery without analysing only the previewed range.
+"""
 import hashlib
 import json
 import math
 from . import db, timeline, planner, media_sources
 
-
-def _display_presets(clips, encodings):
-    presets = {}
-    for position, (clip, encoding) in enumerate(zip(clips, encodings)):
-        key = str(clip['asset_id'])
-        if key not in presets:
-            presets[key] = dict(encoding=encoding, start_ms=clip['start_ms'], positions=[position])
-        else:
-            presets[key]['positions'].append(position)
-    return presets
-
-
-def _apply_display_presets(clips, presets):
-    for clip in clips:
-        preset = presets[str(clip['asset_id'])]
-        duration = clip['end_ms'] - clip['start_ms']
-        clip['start_ms'] = preset['start_ms']
-        clip['end_ms'] = preset['start_ms'] + duration
-        clip['encoding'] = preset['encoding']
-        clip['display_group'] = str(clip['asset_id'])
+VERSION = 2
 
 
 def create(conn, project_id, encodings, white_nits=100):
@@ -47,10 +36,9 @@ def create(conn, project_id, encodings, white_nits=100):
     for clip, encoding in zip(frozen['clips'], encodings):
         clip['encoding'] = encoding
         clip['frames'] = max(1, round((clip['end_ms'] - clip['start_ms']) / 40))
-    presets = _display_presets(frozen['clips'], encodings)
-    _apply_display_presets(frozen['clips'], presets)
-    payload = dict(display_presets=presets, version=1, snapshot=frozen, white_nits=white_nits,
-                   width=160, height=90, fps=25, frames=sum(c['frames'] for c in frozen['clips']))
+    payload = dict(version=VERSION, snapshot=frozen, white_nits=white_nits,
+                   width=160, height=90, fps=25,
+                   frames=sum(c['frames'] for c in frozen['clips']))
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False)
     checksum = hashlib.sha256(encoded.encode()).hexdigest()
     with db.write(conn):
@@ -66,7 +54,29 @@ def get(conn, identity):
     if hashlib.sha256(row['payload'].encode()).hexdigest() != row['payload_sha256']:
         raise ValueError('colour plan checksum mismatch')
     plan = json.loads(row['payload'])
-    if plan['version'] != 1:
+    if plan['version'] not in (1, VERSION):
         raise ValueError('unsupported colour plan')
     plan['id'] = identity
     return plan
+
+
+def encoding_of(plan, index):
+    """Frozen colour interpretation of one occurrence.
+
+    Version 1 plans grouped occurrences by asset and stored one encoding per
+    group; recover the occurrence's encoding from that group, but never reuse
+    another occurrence's trim or exposure.
+    """
+    clips = plan['snapshot']['clips']
+    if not 0 <= index < len(clips):
+        raise ValueError('colour occurrence out of range')
+    clip = clips[index]
+    if 'encoding' in clip:
+        return clip['encoding']
+    presets = plan.get('display_presets') or {}
+    preset = presets.get(clip.get('display_group', str(index)))
+    if preset is not None:
+        positions = preset.get('positions') or []
+        if index in positions or not positions:
+            return preset['encoding']
+    return 'srgb709'
